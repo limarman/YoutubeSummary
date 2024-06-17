@@ -12,6 +12,8 @@ from notion_client import Client
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
+import google.generativeai as genai
+
 from pytube import YouTube
 
 import argparse
@@ -19,7 +21,27 @@ import argparse
 
 NOTION_AUTH_FILE = "notion.txt"
 OPENAI_KEY_FILE = "openai.txt"
+GOOGLE_KEY_FILE = "google.txt"
 
+
+NO_SAFETY_BLOCK = [
+    {
+        "category": "HARM_CATEGORY_HARASSMENT",
+        "threshold": "BLOCK_NONE",
+    },
+    {
+        "category": "HARM_CATEGORY_HATE_SPEECH",
+        "threshold": "BLOCK_NONE",
+    },
+    {
+        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "threshold": "BLOCK_NONE",
+    },
+    {
+        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "threshold": "BLOCK_NONE",
+    },
+    ]
 def connect_notion_client():
 
     if not os.path.exists(NOTION_AUTH_FILE):
@@ -43,6 +65,20 @@ def connect_openai_client():
     openai_client = openai.Client(api_key=api_key)
 
     return openai_client
+
+
+def connect_google_client():
+    if not os.path.exists(GOOGLE_KEY_FILE):
+        raise ValueError("The openai key file could not be found!")
+
+    with open(GOOGLE_KEY_FILE, 'r') as file:
+        api_key = file.read()
+
+    #openai_client = openai.Client(api_key=api_key)
+    genai.configure(api_key=api_key)
+    #model = genai.GenerativeModel('gemini-1.5-flash')
+
+    return None
 
 
 def get_youtube_transcript(video_id):
@@ -185,6 +221,15 @@ def markdown_to_notion_blocks(markdown_text: str):
 
 def create_notion_page(markdown_text, notion_client, page_properties, header_image_url=None):
 
+    # Create a new page in Notion
+    blank_page = {
+        "parent": {"type": "database_id", "database_id": DATABASE_ID},
+        "properties": page_properties,
+    }
+
+    page = notion_client.pages.create(**blank_page)
+
+    # Create the page blocks
     blocks = markdown_to_notion_blocks(markdown_text)
 
     if header_image_url:
@@ -204,13 +249,16 @@ def create_notion_page(markdown_text, notion_client, page_properties, header_ima
         # Insert the image block at the beginning of the blocks list
         blocks.insert(0, image_block)
 
-    new_page = {
-        "parent": {"type": "database_id", "database_id": DATABASE_ID},
-        "properties": page_properties,
-        'children': blocks
-    }
+    # Upload the blocks in chunks of maximum 100 blocks
+    chunks = [blocks[i:i+100] for i in range(0, len(blocks), 100)]
 
-    notion_client.pages.create(**new_page)
+    for chunk in chunks:
+        add_content = {
+            "block_id": page['id'],
+            'children': chunk
+        }
+
+        notion_client.blocks.children.append(**add_content)
 
 
 def extract_openai_response(completion):
@@ -233,6 +281,17 @@ def query_openai_model(user_content, system_message, openai_client: openai.Clien
     )
 
     return completion
+
+def query_google_model(user_content, system_message, model='gemini-1.5-flash'):
+
+    if isinstance(user_content, str):
+        user_content = [user_content]
+
+    model = genai.GenerativeModel(model_name=model, safety_settings=NO_SAFETY_BLOCK)
+
+    response = model.generate_content([system_message] + user_content)
+
+    return response
 
 def get_user_and_system_message(file):
 
@@ -262,11 +321,14 @@ if __name__ == '__main__':
     parser.add_argument("-dbid", "--database-id", default="abe67fb8a1294451a174c8fd61d0ea52", help="The id of the database you want to add the summary to.")
     parser.add_argument("-ui", "--user-info", default="", help="Additional information that is going to be written in the header of the page.")
     parser.add_argument("-reup", "--reupload", action='store_true', help="Uploads the summary output from latest_completion.json to notion instead of regenerating.")
+    parser.add_argument("-type", "-type", default="google", help="Which type of GenAI to use (google, openai)")
 
     args = parser.parse_args()
 
     DATABASE_ID = args.database_id
     URL = args.video_url
+
+    yt = YouTube(URL)
 
     if not args.reupload:
 
@@ -278,32 +340,64 @@ if __name__ == '__main__':
 
         print("PROGRESS: Retrieving the youtube video transcript...")
 
-        transcript = get_youtube_transcript(get_video_id_from_url(URL))
+        transcript = get_youtube_transcript(yt.video_id)
 
         text = convert_transcript_to_text(transcript)
 
         # -------------------------------------------------------------------
-        # Query open AI for summary
+        # Query Generative Model for summary
         # -------------------------------------------------------------------
-
-        print("PROGRESS: Querying OpenAI for summary...")
 
         system_message, user_message = get_user_and_system_message("prompt.txt")
 
-        openai_client = connect_openai_client()
+        if args.type == "openai":
 
-        completion = query_openai_model([text, user_message], system_message, openai_client)
+            print("PROGRESS: Querying OpenAI for summary...")
 
-        with open('latest_completion.json', 'w') as response:
-            json.dump(completion.to_dict(), response, indent=4)
+            openai_client = connect_openai_client()
 
-        output = extract_openai_response(completion)
+            completion = query_openai_model([text, user_message], system_message, openai_client)
+
+            with open('latest_completion.json', 'w') as response:
+                json.dump(completion.to_dict(), response, indent=4)
+
+            output = extract_openai_response(completion)
+
+        elif args.type == "google":
+
+            print("PROGRESS: Querying GoogleAI for summary...")
+
+            connect_google_client()
+
+            #completion = query_openai_model([text, user_message], system_message)
+            completion = query_google_model([text, user_message], system_message)
+
+            with open('latest_completion.json', 'w') as response:
+                json.dump({"text": completion.text}, response, indent=4)
+
+            output = completion.text
+
+        else:
+            raise ValueError(f"No such GenAI type: {args.type}")
 
     else:
-        with open("latest_completion.json", 'r') as latest:
-            data = json.load(latest)
 
-        output = data['choices'][0]['message']['content']
+        if args.type == "openai":
+
+            with open("latest_completion.json", 'r') as latest:
+                data = json.load(latest)
+
+            output = data['choices'][0]['message']['content']
+
+        elif args.type == "google":
+
+            with open("latest_completion.json", 'r') as latest:
+                data = json.load(latest)
+
+            output = data['text']
+
+        else:
+            raise ValueError(f"No such GenAI type {args.type}")
 
     # ---------------------------------------------------------------------------------------
     # Upload the data to notion
@@ -319,8 +413,6 @@ if __name__ == '__main__':
 
     title = output[:summary_start]
     summary = output[summary_start+17:]
-
-    yt = YouTube(URL)
 
     # 2. Upload to notion
     notion_client = connect_notion_client()
